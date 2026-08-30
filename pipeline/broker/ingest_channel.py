@@ -1,0 +1,135 @@
+"""Ingest a whole YouTube channel's transcripts into TeleMem memory (Route A).
+
+Usage examples
+--------------
+    # ingest the 20 most recent uploads of a channel into TeleMem
+    python ingest_channel.py --channel "@Bloomberg" --limit 20 --user-id Bloomberg
+
+    # use a specific TeleMem config (LLM/embedder endpoints) and store raw text
+    TELEMEM_CONFIG=../../telemem/config/config.yaml \
+        python ingest_channel.py --channel https://www.youtube.com/@Bloomberg \
+        --user-id Bloomberg --no-infer
+
+Notes
+-----
+* ``--infer`` (default) sends each transcript chunk through the LLM so TeleMem
+  extracts structured facts. This needs a working ``llm`` + ``embedder`` in your
+  TeleMem config. ``--no-infer`` stores the raw transcript text verbatim and only
+  needs the ``embedder``.
+* Already-processed video ids are recorded in the state file and skipped on
+  re-runs, so this is safe to run repeatedly (e.g. from cron).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import yt_utils
+
+# TeleMem is a mem0 drop-in; import lazily so --help works without it installed.
+def _make_memory(config_path: str | None):
+    import telemem as mem0
+
+    if config_path:
+        from telemem.utils import load_config
+
+        return mem0.Memory(config=load_config(config_path))
+    return mem0.Memory()
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--channel", required=True, help="Channel handle (@name), channel id (UC...), or URL")
+    p.add_argument("--user-id", required=True, help="TeleMem user_id to namespace this channel's memories")
+    p.add_argument("--limit", type=int, default=None, help="Max number of videos to ingest (newest first)")
+    p.add_argument("--langs", default="en", help="Comma-separated caption languages to try, in order")
+    p.add_argument("--config", default=os.getenv("TELEMEM_CONFIG"), help="Path to a TeleMem config YAML")
+    p.add_argument("--work-dir", default=str(Path(__file__).parent / "data"), help="Where to keep transcripts/state")
+    p.add_argument("--chunk-chars", type=int, default=4000, help="Max characters per memory chunk (0 = no split)")
+    p.add_argument("--infer", dest="infer", action="store_true", default=True, help="LLM fact extraction (default)")
+    p.add_argument("--no-infer", dest="infer", action="store_false", help="Store raw transcript text verbatim")
+    p.add_argument("--keep-transcripts", action="store_true", help="Do not delete caption files after ingest")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    langs = [x.strip() for x in args.langs.split(",") if x.strip()]
+
+    work = Path(args.work_dir)
+    transcripts_dir = work / "transcripts"
+    state_path = str(work / f"state_{args.user_id}.json")
+    state = yt_utils.load_state(state_path)
+    processed = set(state.get("processed", []))
+
+    print(f"Enumerating channel: {args.channel}")
+    videos = yt_utils.list_channel_videos(args.channel, limit=args.limit)
+    print(f"Found {len(videos)} videos ({len(processed)} already processed).")
+    if not videos:
+        print("Nothing to do.")
+        return 0
+
+    memory = _make_memory(args.config)
+
+    added, skipped, failed = 0, 0, 0
+    for i, video in enumerate(videos, 1):
+        vid = video["id"]
+        title = video["title"] or vid
+        if vid in processed:
+            skipped += 1
+            continue
+
+        print(f"[{i}/{len(videos)}] {vid} :: {title}")
+        try:
+            sub_path = yt_utils.download_transcript(video["url"], str(transcripts_dir), langs=langs)
+            if not sub_path:
+                print("    no captions available, skipping")
+                failed += 1
+                continue
+
+            text = yt_utils.transcript_to_text(sub_path)
+            if not args.keep_transcripts:
+                try:
+                    os.remove(sub_path)
+                except OSError:
+                    pass
+
+            if not text:
+                print("    empty transcript, skipping")
+                failed += 1
+                continue
+
+            chunks = yt_utils.chunk_text(text, args.chunk_chars)
+            for j, chunk in enumerate(chunks):
+                metadata = {
+                    "source": "youtube",
+                    "video_id": vid,
+                    "title": title,
+                    "url": video["url"],
+                    "chunk": j,
+                    "chunks_total": len(chunks),
+                }
+                memory.add(chunk, user_id=args.user_id, metadata=metadata, infer=args.infer)
+
+            processed.add(vid)
+            state["processed"] = sorted(processed)
+            yt_utils.save_state(state_path, state)
+            added += 1
+            print(f"    stored {len(chunks)} chunk(s)")
+        except KeyboardInterrupt:
+            print("\nInterrupted; progress saved.")
+            break
+        except Exception as exc:  # keep going on a single bad video
+            failed += 1
+            print(f"    ERROR: {exc}")
+
+    print(f"\nDone. added={added} skipped={skipped} failed={failed}")
+    print(f"State: {state_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
