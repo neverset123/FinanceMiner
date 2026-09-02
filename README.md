@@ -3,7 +3,7 @@
 2. https://kalshi.com/
 3. https://polymarket.com/
 4. https://github.com/TraderAlice/OpenAlice
-5. 
+5. https://github.com/PandaAI-Tech/panda_factor
 
 ## Video Generation Pipeline
 
