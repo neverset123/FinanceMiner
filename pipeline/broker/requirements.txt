@@ -1,3 +1,7 @@
 # Route A (transcript-only) YouTube -> TeleMem memory pipeline
 telemem>=1.10.0
 yt-dlp>=2024.8.6
+python-dotenv>=1.0
+
+# Optional: audio transcription fallback when YouTube captions are unavailable
+faster-whisper>=1.0.0

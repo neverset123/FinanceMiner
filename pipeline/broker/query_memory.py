@@ -1,13 +1,13 @@
-"""Query TeleMem memory built from a YouTube channel's transcripts (Route A).
+"""Query TeleMem memory built from a YouTube channel's transcripts
 
 Usage examples
 --------------
     # semantic search over one channel's ingested transcripts
-    python query_memory.py --user-id Bloomberg --query "what did they say about rate cuts?"
+    python query_memory.py --user-id bellafinance --query "what did they say about china economy?"
 
     # print an LLM-ready context block instead of a bare list
     TELEMEM_CONFIG=../../telemem/config/config.yaml \
-        python query_memory.py --user-id Bloomberg --query "inflation outlook" --as-context
+        python query_memory.py --user-id bellafinance --query "inflation outlook" --as-context
 
 The ``--as-context`` mode formats the top hits into a prompt block you can paste
 in front of a user question so an LLM answers grounded in the channel's content.
@@ -20,14 +20,7 @@ import os
 import sys
 
 
-def _make_memory(config_path: str | None):
-    import telemem as mem0
-
-    if config_path:
-        from telemem.utils import load_config
-
-        return mem0.Memory(config=load_config(config_path))
-    return mem0.Memory()
+from config import make_memory as _make_memory
 
 
 def parse_args(argv=None) -> argparse.Namespace:

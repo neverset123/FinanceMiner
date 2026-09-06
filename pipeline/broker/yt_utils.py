@@ -167,8 +167,89 @@ _VTT_TAG = re.compile(r"<[^>]+>")
 _CUE_SETTING = re.compile(r"\balign:|\bposition:|\bsize:|\bline:")
 
 
+def transcribe_with_whisper(
+    video_url: str,
+    dest_dir: str,
+    model_name: str = "medium",
+    language: Optional[str] = None,
+) -> Optional[str]:
+    """Download audio and transcribe with faster-whisper.
+
+    Returns the path to a ``.txt`` file containing the transcript, or ``None``
+    if the download or transcription failed.
+
+    The model is loaded fresh each call (fine for one-shot CLI runs).
+
+    Env vars:
+      WHISPER_DEVICE     – ``auto`` (default), ``cpu``, or ``cuda``
+      WHISPER_MODEL_PATH – local directory containing the CTranslate2 model files;
+                           when set, ``model_name`` is ignored and no download occurs.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise ImportError(
+            "faster-whisper is required for audio transcription. "
+            "Install it with: pip install faster-whisper"
+        ) from exc
+
+    import yt_dlp
+
+    os.makedirs(dest_dir, exist_ok=True)
+    video_id = _extract_video_id(video_url)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        print(f"    [whisper] downloading audio to {tmp} …", flush=True)
+        ydl_opts = {
+            # Prefer m4a so faster-whisper can read it without a separate ffmpeg step.
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": os.path.join(tmp, f"{video_id}.%(ext)s"),
+            "quiet": False,
+            "ignoreerrors": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+        if not info:
+            print("    [whisper] audio download returned no info", flush=True)
+            return None
+
+        audio_files = [
+            f for f in os.listdir(tmp)
+            if f.startswith(video_id) and os.path.splitext(f)[1] in {".m4a", ".mp3", ".webm", ".opus", ".ogg"}
+        ]
+        if not audio_files:
+            print("    [whisper] no audio file found after download", flush=True)
+            return None
+        audio_path = os.path.join(tmp, audio_files[0])
+        print(f"    [whisper] audio ready: {audio_files[0]} ({os.path.getsize(audio_path) // 1024}KB)", flush=True)
+
+        device = os.getenv("WHISPER_DEVICE", "auto")
+        compute = "float16" if device == "cuda" else "int8"
+        model_path = os.getenv("WHISPER_MODEL_PATH") or model_name
+        print(f"    [whisper] loading model from {model_path!r} (device={device}) …", flush=True)
+        model = WhisperModel(model_path, device=device, compute_type=compute)
+        print(f"    [whisper] transcribing …", flush=True)
+        segments, info2 = model.transcribe(audio_path, language=language, beam_size=5)
+        print(f"    [whisper] detected language: {info2.language} (p={info2.language_probability:.2f})", flush=True)
+
+        text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+        if not text:
+            print("    [whisper] transcription produced empty text", flush=True)
+            return None
+
+        out_path = os.path.join(dest_dir, f"{video_id}.txt")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print(f"    [whisper] saved transcript: {out_path} ({len(text)} chars)", flush=True)
+        return out_path
+
+
 def transcript_to_text(path: str) -> str:
-    """Parse a VTT or SRT caption file into clean, de-duplicated plain text."""
+    """Parse a VTT/SRT caption file or plain .txt into clean plain text."""
+    if path.endswith(".txt"):
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            return fh.read().strip()
+
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         raw_lines = [ln.rstrip("\n") for ln in fh]
 

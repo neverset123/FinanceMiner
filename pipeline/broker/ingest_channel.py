@@ -1,4 +1,4 @@
-"""Ingest a whole YouTube channel's transcripts into TeleMem memory (Route A).
+"""Ingest a whole YouTube channel's transcripts into TeleMem memory.
 
 Usage examples
 --------------
@@ -6,7 +6,6 @@ Usage examples
     python ingest_channel.py --channel "@Bloomberg" --limit 20 --user-id Bloomberg
 
     # use a specific TeleMem config (LLM/embedder endpoints) and store raw text
-    TELEMEM_CONFIG=../../telemem/config/config.yaml \
         python ingest_channel.py --channel https://www.youtube.com/@Bloomberg \
         --user-id Bloomberg --no-infer
 
@@ -29,15 +28,7 @@ from pathlib import Path
 
 import yt_utils
 
-# TeleMem is a mem0 drop-in; import lazily so --help works without it installed.
-def _make_memory(config_path: str | None):
-    import telemem as mem0
-
-    if config_path:
-        from telemem.utils import load_config
-
-        return mem0.Memory(config=load_config(config_path))
-    return mem0.Memory()
+from config import make_memory as _make_memory
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -52,6 +43,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--infer", dest="infer", action="store_true", default=True, help="LLM fact extraction (default)")
     p.add_argument("--no-infer", dest="infer", action="store_false", help="Store raw transcript text verbatim")
     p.add_argument("--keep-transcripts", action="store_true", help="Do not delete caption files after ingest")
+    p.add_argument(
+        "--whisper-model",
+        default=None,
+        metavar="SIZE",
+        help="Fall back to faster-whisper transcription when captions are unavailable. "
+             "SIZE is the model name: tiny, base, small, medium (default), large-v3. "
+             "Requires: pip install faster-whisper",
+    )
     return p.parse_args(argv)
 
 
@@ -86,9 +85,15 @@ def main(argv=None) -> int:
         try:
             sub_path = yt_utils.download_transcript(video["url"], str(transcripts_dir), langs=langs)
             if not sub_path:
-                print("    no captions available, skipping")
-                failed += 1
-                continue
+                if args.whisper_model:
+                    print(f"    no captions, transcribing with whisper ({args.whisper_model})…")
+                    sub_path = yt_utils.transcribe_with_whisper(
+                        video["url"], str(transcripts_dir), model_name=args.whisper_model
+                    )
+                if not sub_path:
+                    print("    no captions available, skipping")
+                    failed += 1
+                    continue
 
             text = yt_utils.transcript_to_text(sub_path)
             if not args.keep_transcripts:
@@ -123,8 +128,10 @@ def main(argv=None) -> int:
             print("\nInterrupted; progress saved.")
             break
         except Exception as exc:  # keep going on a single bad video
+            import traceback
             failed += 1
             print(f"    ERROR: {exc}")
+            traceback.print_exc()
 
     print(f"\nDone. added={added} skipped={skipped} failed={failed}")
     print(f"State: {state_path}")
