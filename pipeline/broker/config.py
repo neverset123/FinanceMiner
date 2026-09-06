@@ -36,7 +36,7 @@ _BASE_URLS: dict[str, str] = {
 }
 
 _DEFAULT_MODELS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5-20251001",
+    "anthropic": "anthropic::claude-haiku-4-5-20251001",
     "openai": "gpt-4o-mini",
     "gemini": "gemini-2.0-flash",
     "local": "qwen3-8b",
@@ -53,6 +53,9 @@ def _resolve_llm() -> dict:
     key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
     if key:
         base_url = os.getenv("ANTHROPIC_BASE_URL", _BASE_URLS["anthropic"])
+        # Ensure /v1 suffix for OpenAI-compatible endpoint (mirrors agent/config.py)
+        if base_url and not base_url.endswith("/v1") and not base_url.endswith("/v1/"):
+            base_url = base_url.rstrip("/") + "/v1"
         model = os.getenv("CHAT_MODEL", _DEFAULT_MODELS["anthropic"])
         return {
             "provider": "openai",
