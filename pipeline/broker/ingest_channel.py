@@ -23,12 +23,42 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
 import yt_utils
 
-from config import make_memory as _make_memory
+from config import make_memory as _make_memory, build_telemem_config
+
+
+def _ensure_upload_date_column(db_path: str) -> None:
+    """Add the ``upload_date`` column to history if it doesn't exist yet."""
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(history)")}
+        if "upload_date" not in cols:
+            conn.execute("ALTER TABLE history ADD COLUMN upload_date TEXT")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_upload_date(db_path: str, memory_ids: list[str], upload_date: str) -> None:
+    """Stamp ``upload_date`` on history rows matching *memory_ids*."""
+    if not memory_ids or not upload_date:
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        placeholders = ",".join("?" for _ in memory_ids)
+        conn.execute(
+            f"UPDATE history SET upload_date = ? "
+            f"WHERE memory_id IN ({placeholders}) AND upload_date IS NULL",
+            [upload_date, *memory_ids],
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -73,6 +103,11 @@ def main(argv=None) -> int:
 
     memory = _make_memory(args.config)
 
+    # Resolve history.db path and ensure upload_date column exists
+    cfg = build_telemem_config()
+    history_db = cfg.get("history_db_path", "db/history.db")
+    _ensure_upload_date_column(history_db)
+
     added, skipped, failed = 0, 0, 0
     for i, video in enumerate(videos, 1):
         vid = video["id"]
@@ -108,16 +143,27 @@ def main(argv=None) -> int:
                 continue
 
             chunks = yt_utils.chunk_text(text, args.chunk_chars)
+            upload_date = video.get("upload_date") or ""
+            memory_ids = []
             for j, chunk in enumerate(chunks):
                 metadata = {
                     "source": "youtube",
                     "video_id": vid,
                     "title": title,
                     "url": video["url"],
+                    "upload_date": upload_date,
                     "chunk": j,
                     "chunks_total": len(chunks),
                 }
-                memory.add(chunk, user_id=args.user_id, metadata=metadata, infer=args.infer)
+                result = memory.add(chunk, user_id=args.user_id, metadata=metadata, infer=args.infer)
+                # Collect memory IDs from the result to backfill upload_date in history.db
+                if result and isinstance(result, dict):
+                    for r in result.get("results", []):
+                        mid = r.get("id") or r.get("memory_id")
+                        if mid:
+                            memory_ids.append(mid)
+
+            _set_upload_date(history_db, memory_ids, upload_date)
 
             processed.add(vid)
             state["processed"] = sorted(processed)

@@ -77,6 +77,7 @@ def list_channel_videos(channel: str, limit: Optional[int] = None) -> List[Dict[
                 "id": vid,
                 "url": entry.get("url") or f"https://www.youtube.com/watch?v={vid}",
                 "title": entry.get("title") or "",
+                "upload_date": entry.get("upload_date") or "",
             }
         )
         if limit and len(videos) >= limit:
@@ -172,6 +173,7 @@ def transcribe_with_whisper(
     dest_dir: str,
     model_name: str = "medium",
     language: Optional[str] = None,
+    initial_prompt: Optional[str] = None,
 ) -> Optional[str]:
     """Download audio and transcribe with faster-whisper.
 
@@ -229,8 +231,27 @@ def transcribe_with_whisper(
         print(f"    [whisper] loading model from {model_path!r} (device={device}) …", flush=True)
         model = WhisperModel(model_path, device=device, compute_type=compute)
         print(f"    [whisper] transcribing …", flush=True)
-        segments, info2 = model.transcribe(audio_path, language=language, beam_size=5)
-        print(f"    [whisper] detected language: {info2.language} (p={info2.language_probability:.2f})", flush=True)
+        # Use initial_prompt to nudge Whisper toward simplified Chinese output
+        # when the audio is Chinese. Whisper's Chinese output style is influenced
+        # by the prompt: providing simplified Chinese text biases decoding accordingly.
+        transcribe_lang = language
+        if initial_prompt is None:
+            if (language or "").startswith("zh"):
+                initial_prompt = "以下是普通话的句子。"
+            elif language is None:
+                # Auto-detect: run a short detection pass first so we can apply
+                # the simplified-Chinese prompt when needed.
+                _, detect_info = model.transcribe(audio_path, language=None, beam_size=1)
+                detected = detect_info.language
+                print(f"    [whisper] detected language: {detected} (p={detect_info.language_probability:.2f})", flush=True)
+                if detected == "zh":
+                    initial_prompt = "以下是普通话的句子。"
+                    transcribe_lang = "zh"
+        segments, info2 = model.transcribe(
+            audio_path, language=transcribe_lang, beam_size=5,
+            initial_prompt=initial_prompt,
+        )
+        print(f"    [whisper] transcription language: {info2.language} (p={info2.language_probability:.2f})", flush=True)
 
         text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
         if not text:
