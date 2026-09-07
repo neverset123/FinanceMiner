@@ -5,9 +5,9 @@ py311 is required
 ```
 export WHISPER_MODEL_PATH=~/Workspace/whisper-medium/
 export EMBEDDING_MODEL=qgenie_embedd
-HF_HUB_OFFLINE=1 python pipeline/broker/ingest_channel.py --channel https://www.youtube.com/@bellafinance  --limit 1 --user-id bellafinance --no-infer --whisper-model medium
+HF_HUB_OFFLINE=1 python pipeline/broker/ingest_channel.py --channel https://www.youtube.com/@bellafinance  --limit 20 --user-id bellafinance --no-infer --whisper-model medium
 python pipeline/broker/query_memory.py --user-id bellafinance --query "inflation outlook" --as-context
-
+python pipeline/broker/holding_recommendation.py  --output holding_rec.md
 ```
 
 ### sc
