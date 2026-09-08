@@ -44,7 +44,7 @@ def fetch_history(db_path: str | Path, limit: int) -> list[dict]:
         cur = conn.execute(
             "SELECT id, memory_id, old_memory, new_memory, event, "
             "       created_at, updated_at, is_deleted, actor_id, role, upload_date "
-            "FROM history ORDER BY upload_date DESC LIMIT ?",
+            "FROM history ORDER BY COALESCE(NULLIF(upload_date, ''), created_at) DESC LIMIT ?",
             (limit,),
         )
     else:
