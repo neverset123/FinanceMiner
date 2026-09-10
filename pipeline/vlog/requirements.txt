@@ -3,3 +3,6 @@ edge-tts
 Pillow
 requests
 pyttsx3
+playwright
+httpx
+python-dotenv

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,10 +22,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 AuthProvider = Literal["anthropic", "openai", "gemini", "bedrock", "custom"]
 
@@ -127,11 +124,6 @@ class LLMConfig:
         )
 
 
-# ---------------------------------------------------------------------------
-# LLM Client
-# ---------------------------------------------------------------------------
-
-
 def _build_http_client() -> httpx.Client:
     """Build httpx client respecting proxy and SSL settings from environment."""
     verify = os.getenv("NODE_TLS_REJECT_UNAUTHORIZED", "1") != "0"
@@ -160,10 +152,6 @@ class LLMClient:
         return response.choices[0].message.content or ""
 
 
-# ---------------------------------------------------------------------------
-# Keyword Extraction
-# ---------------------------------------------------------------------------
-
 SYSTEM_PROMPT = """\
 You are a visual research assistant. Given a list of Chinese script lines \
 (for a video narration), return a JSON array of concise English image search \
@@ -176,6 +164,40 @@ Rules:
 - Prefer concrete, photographable subjects over abstract concepts.
 - For greetings or sign-offs, use a relevant cityscape or studio background.
 """
+
+
+CHUNK_SIZE = 150  # target characters per chunk
+
+
+def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+    """Split text into context chunks of approximately chunk_size characters.
+
+    Handles both multi-line text (respects existing line breaks when lines are
+    already short enough) and single-line text (splits on Chinese/English
+    sentence boundaries then groups by target size).
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+    # If lines are already reasonably sized, keep them as-is
+    if len(lines) > 1 and all(len(l) <= chunk_size * 2 for l in lines):
+        return lines
+
+    # Flatten and split on sentence-ending punctuation
+    flat = " ".join(lines)
+    sentences = [s.strip() for s in re.split(r"(?<=[。！？!?])", flat) if s.strip()]
+
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) > chunk_size:
+            chunks.append(current.strip())
+            current = sentence
+        else:
+            current += sentence
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks or lines
 
 
 def extract_keywords(lines: list[str], *, config: LLMConfig | None = None) -> list[str]:
@@ -246,15 +268,10 @@ def extract_keywords(lines: list[str], *, config: LLMConfig | None = None) -> li
 
 
 if __name__ == "__main__":
-    script_path = sys.argv[1] if len(sys.argv) > 1 else "script.txt"
-    raw_lines = [
-        l.strip()
-        for l in Path(script_path).read_text(encoding="utf-8").splitlines()
-        if l.strip() and not l.strip().startswith("#")
-    ]
-    # Strip @@ overrides for extraction
-    clean_lines = [l.split("@@")[0].strip() for l in raw_lines]
+    script_path = sys.argv[1] if len(sys.argv) > 1 else "transcript.txt"
+    text = Path(script_path).read_text(encoding="utf-8")
+    lines = split_into_chunks(text)
 
-    keywords = extract_keywords(clean_lines)
-    for i, (line, kw) in enumerate(zip(clean_lines, keywords), 1):
+    keywords = extract_keywords(lines)
+    for i, (line, kw) in enumerate(zip(lines, keywords), 1):
         print(f"  [{i}] {line[:30]:30s} → {kw}")
