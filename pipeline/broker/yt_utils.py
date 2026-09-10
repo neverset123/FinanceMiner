@@ -166,6 +166,18 @@ def _pick_subtitle_file(folder: str, video_id: str, langs: List[str]) -> Optiona
 _TS_LINE = re.compile(r"-->")
 _VTT_TAG = re.compile(r"<[^>]+>")
 _CUE_SETTING = re.compile(r"\balign:|\bposition:|\bsize:|\bline:")
+_ZH_SCRIPT = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+
+
+def _to_simplified(text: str) -> str:
+    """Convert traditional Chinese characters to simplified, no-op for other scripts."""
+    if not _ZH_SCRIPT.search(text):
+        return text
+    try:
+        import opencc
+        return opencc.OpenCC("t2s").convert(text)
+    except ImportError:
+        return text
 
 
 def transcribe_with_whisper(
@@ -231,29 +243,21 @@ def transcribe_with_whisper(
         print(f"    [whisper] loading model from {model_path!r} (device={device}) …", flush=True)
         model = WhisperModel(model_path, device=device, compute_type=compute)
         print(f"    [whisper] transcribing …", flush=True)
-        # Use initial_prompt to nudge Whisper toward simplified Chinese output
-        # when the audio is Chinese. Whisper's Chinese output style is influenced
-        # by the prompt: providing simplified Chinese text biases decoding accordingly.
         transcribe_lang = language
-        if initial_prompt is None:
-            if (language or "").startswith("zh"):
-                initial_prompt = "以下是普通话的句子。"
-            elif language is None:
-                # Auto-detect: run a short detection pass first so we can apply
-                # the simplified-Chinese prompt when needed.
-                _, detect_info = model.transcribe(audio_path, language=None, beam_size=1)
-                detected = detect_info.language
-                print(f"    [whisper] detected language: {detected} (p={detect_info.language_probability:.2f})", flush=True)
-                if detected == "zh":
-                    initial_prompt = "以下是普通话的句子。"
-                    transcribe_lang = "zh"
+        if language is None:
+            # Auto-detect: run a short pass so we can lock in "zh" for Mandarin audio.
+            _, detect_info = model.transcribe(audio_path, language=None, beam_size=1)
+            detected = detect_info.language
+            print(f"    [whisper] detected language: {detected} (p={detect_info.language_probability:.2f})", flush=True)
+            if detected == "zh":
+                transcribe_lang = "zh"
         segments, info2 = model.transcribe(
             audio_path, language=transcribe_lang, beam_size=5,
             initial_prompt=initial_prompt,
         )
         print(f"    [whisper] transcription language: {info2.language} (p={info2.language_probability:.2f})", flush=True)
 
-        text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+        text = _to_simplified(" ".join(seg.text.strip() for seg in segments if seg.text.strip()))
         if not text:
             print("    [whisper] transcription produced empty text", flush=True)
             return None
@@ -293,7 +297,7 @@ def transcript_to_text(path: str) -> str:
             continue
         text_lines.append(cleaned)
 
-    return _dedupe_overlap(text_lines)
+    return _to_simplified(_dedupe_overlap(text_lines))
 
 
 def _dedupe_overlap(lines: List[str]) -> str:

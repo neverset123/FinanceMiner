@@ -5,3 +5,6 @@ python-dotenv>=1.0
 
 # Optional: audio transcription fallback when YouTube captions are unavailable
 faster-whisper>=1.0.0
+
+# Traditional -> Simplified Chinese conversion
+opencc-python-reimplemented>=0.1.7

@@ -14,8 +14,8 @@ python pipeline/broker/broker_blog.py -n 2 -o report.md  --raw
 ### sc
 ´´´
 sc broker overview --json
-sc broker holdings --json
-sc broker chart --isin US67066G1040 --timeframe 1y --json >> data/sc/json/nv_chart.json
+sc broker holdings --json >> data/sc/json/holdings.json
+sc broker chart --isin US67066G1040 --timeframe max --json >> data/sc/json/nv_chart.json
 sc broker quote --isin DE0007100000 --json
 sc broker security-news --isin US67066G1040 --json >> data/sc/json/nv_news.json
 ´´´
