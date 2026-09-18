@@ -19,3 +19,8 @@ sc broker chart --isin US67066G1040 --timeframe max --json >> data/sc/json/nv_ch
 sc broker quote --isin DE0007100000 --json
 sc broker security-news --isin US67066G1040 --json >> data/sc/json/nv_news.json
 ´´´
+
+### t212
+´´´
+python pipeline/broker/t212.py >> data/t212/json/orders.json
+´´´

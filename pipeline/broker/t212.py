@@ -377,7 +377,7 @@ def _page_params(**kwargs: Any) -> Dict[str, Any]:
 if __name__ == "__main__":
     with Trading212Client.from_env() as t212:
         # print(json.dumps(t212.account_summary()))
-        print(json.dumps(t212.positions()))
-        # print(json.dumps(list(t212.iter_history_orders())))
+        # print(json.dumps(t212.positions()))
+        print(json.dumps(list(t212.iter_history_orders())))
         # print(json.dumps(list(t212.iter_transactions())))
 
