@@ -10,6 +10,10 @@ python pipeline/broker/query_memory.py --user-id bellafinance --query "inflation
 python pipeline/broker/holding_recommendation.py  --output holding_rec.md
 python pipeline/broker/broker_blog.py -n 2 -o report.md  --raw
 ```
+### ingest podcast
+´´´
+python pipeline/broker/ingest_podcast.py --whisper-model medium --user-id crossing
+´´´
 
 ### sc
 ´´´
