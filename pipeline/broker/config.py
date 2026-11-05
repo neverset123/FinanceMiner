@@ -188,6 +188,14 @@ def _patch_memory_ssl(memory) -> None:
             http_client=http_client,
         )
 
+    llm = getattr(memory, "llm", None)
+    if llm and hasattr(llm, "client"):
+        llm.client = OpenAI(
+            api_key=llm.client.api_key,
+            base_url=str(llm.client.base_url),
+            http_client=http_client,
+        )
+
 
 def make_memory(config_path: str | None = None):
     """Return a TeleMemory instance configured from a file or env vars.

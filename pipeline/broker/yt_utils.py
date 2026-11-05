@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
@@ -141,7 +142,10 @@ def download_transcript(
 
         ext = os.path.splitext(picked)[1]
         final_path = os.path.join(dest_dir, f"{video_id}{ext}")
-        Path(picked).replace(final_path)
+        # Use shutil.move: os.replace fails across filesystems (e.g. WSL /tmp -> /mnt/c).
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        shutil.move(picked, final_path)
         return final_path
 
 

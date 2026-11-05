@@ -1,18 +1,23 @@
 ## broker
 py311 is required
 
-### ingest news
+### ingest youtube channel/playlist
 ```
 export WHISPER_MODEL_PATH=~/Workspace/whisper-medium/
 export EMBEDDING_MODEL=qgenie_embedd
-HF_HUB_OFFLINE=1 python pipeline/broker/ingest_channel.py --channel https://www.youtube.com/@bellafinance  --limit 2 --user-id bellafinance --no-infer --whisper-model medium
+HF_HUB_OFFLINE=1 python pipeline/broker/ingest_channel.py --channel https://www.youtube.com/@bellafinance  --limit 6 --user-id bellafinance --no-infer --whisper-model medium
+HF_HUB_OFFLINE=1 python pipeline/broker/ingest_channel.py --playlist https://www.youtube.com/playlist?list=PLangBM27OtEA --limit 10 --user-id standfordRSI --no-infer --whisper-model medium
 python pipeline/broker/query_memory.py --user-id bellafinance --query "inflation outlook" --as-context
 python pipeline/broker/holding_recommendation.py  --output holding_rec.md
-python pipeline/broker/broker_blog.py -n 2 -o report.md  --raw
+python pipeline/broker/broker_blog.py --user-id bellafinance -n 4 -o report.md  --raw
+python pipeline/broker/broker_blog.py --user-id standfordRSI -n 200 -o report_rsi.md  --raw
 ```
 ### ingest podcast
 ´´´
-python pipeline/broker/ingest_podcast.py --whisper-model medium --user-id crossing
+export WHISPER_MODEL_PATH=~/Workspace/whisper-medium/
+export EMBEDDING_MODEL=qgenie_embedd
+HF_HUB_OFFLINE=1 python pipeline/broker/ingest_podcast.py --whisper-model medium --user-id crossing --no-infer
+python pipeline/broker/broker_blog.py --db db/history_podcast.db -n 20 -o report_cross.md  --raw
 ´´´
 
 ### sc

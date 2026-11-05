@@ -9,6 +9,12 @@ Usage examples
         python ingest_channel.py --channel https://www.youtube.com/@Bloomberg \
         --user-id Bloomberg --no-infer
 
+    # ingest a specific playlist (by id or full URL)
+        python ingest_channel.py --playlist PLxxxxxxxxxxxxxxxx --user-id MyList
+        python ingest_channel.py \
+            --playlist "https://www.youtube.com/playlist?list=PLxxxx" \
+            --user-id MyList
+
 Notes
 -----
 * ``--infer`` (default) sends each transcript chunk through the LLM so TeleMem
@@ -61,9 +67,19 @@ def _set_upload_date(db_path: str, memory_ids: list[str], upload_date: str) -> N
         conn.close()
 
 
+def _playlist_to_url(playlist: str) -> str:
+    """Accept a playlist id (PL..., UU..., etc.) or a full URL and return a playlist URL."""
+    playlist = playlist.strip()
+    if playlist.startswith(("http://", "https://")):
+        return playlist
+    return f"https://www.youtube.com/playlist?list={playlist}"
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--channel", required=True, help="Channel handle (@name), channel id (UC...), or URL")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--channel", help="Channel handle (@name), channel id (UC...), or URL")
+    src.add_argument("--playlist", help="Playlist id (PL..., UU..., LL..., etc.) or full playlist URL")
     p.add_argument("--user-id", required=True, help="TeleMem user_id to namespace this channel's memories")
     p.add_argument("--limit", type=int, default=None, help="Max number of videos to ingest (newest first)")
     p.add_argument("--langs", default="en", help="Comma-separated caption languages to try, in order")
@@ -94,8 +110,10 @@ def main(argv=None) -> int:
     state = yt_utils.load_state(state_path)
     processed = set(state.get("processed", []))
 
-    print(f"Enumerating channel: {args.channel}")
-    videos = yt_utils.list_channel_videos(args.channel, limit=args.limit)
+    source = args.channel if args.channel else _playlist_to_url(args.playlist)
+    label = "channel" if args.channel else "playlist"
+    print(f"Enumerating {label}: {source}")
+    videos = yt_utils.list_channel_videos(source, limit=args.limit)
     print(f"Found {len(videos)} videos ({len(processed)} already processed).")
     if not videos:
         print("Nothing to do.")

@@ -18,6 +18,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -29,34 +30,80 @@ _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent
 
 
-def fetch_history(db_path: str | Path, limit: int) -> list[dict]:
-    """Return the latest *limit* rows from the history table as dicts."""
+def fetch_history(
+    db_path: str | Path,
+    limit: int,
+    user_id: str | None = None,
+    faiss_json: str | Path | None = None,
+) -> list[dict]:
+    """Return the latest *limit* rows from the history table as dicts.
+
+    If ``user_id`` is provided, results are restricted to memory_ids whose
+    docstore metadata in ``faiss_json`` has a matching ``user_id``.
+    """
     db_path = Path(db_path)
     if not db_path.exists():
         print(f"ERROR: database not found: {db_path}", file=sys.stderr)
         sys.exit(1)
 
+    allowed_ids: set[str] | None = None
+    if user_id:
+        if faiss_json is None:
+            faiss_json = _REPO_ROOT / "db" / "faiss_db" / "telemem.json"
+        allowed_ids = _memory_ids_for_user(Path(faiss_json), user_id)
+        if not allowed_ids:
+            print(
+                f"WARN: no memories found for user_id={user_id!r} in {faiss_json}",
+                file=sys.stderr,
+            )
+            return []
+
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     # Check if upload_date column exists (added by ingest_channel.py)
     cols = {row[1] for row in conn.execute("PRAGMA table_info(history)")}
-    if "upload_date" in cols:
-        cur = conn.execute(
-            "SELECT id, memory_id, old_memory, new_memory, event, "
-            "       created_at, updated_at, is_deleted, actor_id, role, upload_date "
-            "FROM history ORDER BY COALESCE(NULLIF(upload_date, ''), created_at) DESC LIMIT ?",
-            (limit,),
+    has_upload = "upload_date" in cols
+
+    select_cols = (
+        "SELECT id, memory_id, old_memory, new_memory, event, "
+        "       created_at, updated_at, is_deleted, actor_id, role"
+        + (", upload_date " if has_upload else " ")
+        + "FROM history "
+    )
+    if has_upload:
+        order_by = (
+            "ORDER BY COALESCE(NULLIF(upload_date, ''), substr(created_at, 1, 16)) DESC, "
+            "         created_at ASC, id ASC "
         )
     else:
-        cur = conn.execute(
-            "SELECT id, memory_id, old_memory, new_memory, event, "
-            "       created_at, updated_at, is_deleted, actor_id, role "
-            "FROM history ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
+        order_by = "ORDER BY substr(created_at, 1, 16) DESC, created_at ASC, id ASC "
+
+    params: list = []
+    where = ""
+    if allowed_ids is not None:
+        # SQLite has a default limit of 999 host params; chunk if huge.
+        ids = list(allowed_ids)
+        placeholders = ",".join("?" for _ in ids)
+        where = f"WHERE memory_id IN ({placeholders}) "
+        params.extend(ids)
+
+    params.append(limit)
+    cur = conn.execute(select_cols + where + order_by + "LIMIT ?", params)
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
+
+
+def _memory_ids_for_user(faiss_json: Path, user_id: str) -> set[str]:
+    """Load telemem docstore JSON and return memory_ids where user_id matches."""
+    if not faiss_json.exists():
+        print(f"ERROR: faiss docstore not found: {faiss_json}", file=sys.stderr)
+        sys.exit(1)
+    with open(faiss_json, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    docstore = data.get("docstore", {}) if isinstance(data, dict) else {}
+    return {mid for mid, meta in docstore.items()
+            if isinstance(meta, dict) and meta.get("user_id") == user_id}
 
 
 def build_openai_client():
@@ -185,6 +232,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Skip LLM summarisation; just dump records",
     )
+    p.add_argument(
+        "--user-id",
+        default=None,
+        help="Only include records whose memories belong to this TeleMem user_id "
+             "(resolved via the FAISS docstore JSON).",
+    )
+    p.add_argument(
+        "--faiss-json",
+        default=str(_REPO_ROOT / "db" / "faiss_db" / "telemem.json"),
+        help="Path to the TeleMem FAISS docstore JSON (default: db/faiss_db/telemem.json). "
+             "Only used when --user-id is set.",
+    )
     return p.parse_args(argv)
 
 
@@ -192,8 +251,14 @@ def main(argv=None) -> int:
     args = parse_args(argv)
 
     # --- fetch ---
-    print(f"Reading latest {args.limit} records from: {args.db}", file=sys.stderr)
-    rows = fetch_history(args.db, args.limit)
+    scope = f" (user_id={args.user_id})" if args.user_id else ""
+    print(f"Reading latest {args.limit} records from: {args.db}{scope}", file=sys.stderr)
+    rows = fetch_history(
+        args.db,
+        args.limit,
+        user_id=args.user_id,
+        faiss_json=args.faiss_json,
+    )
     print(f"  {len(rows)} records fetched.", file=sys.stderr)
 
     if not rows:
