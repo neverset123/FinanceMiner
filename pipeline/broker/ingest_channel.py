@@ -84,11 +84,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None, help="Max number of videos to ingest (newest first)")
     p.add_argument("--langs", default="en", help="Comma-separated caption languages to try, in order")
     p.add_argument("--config", default=os.getenv("TELEMEM_CONFIG"), help="Path to a TeleMem config YAML")
-    p.add_argument("--work-dir", default=str(Path(__file__).parent / "data"), help="Where to keep transcripts/state")
+    p.add_argument("--work-dir", default="./data/youtube", help="Where to keep transcripts state")
     p.add_argument("--chunk-chars", type=int, default=4000, help="Max characters per memory chunk (0 = no split)")
-    p.add_argument("--infer", dest="infer", action="store_true", default=True, help="LLM fact extraction (default)")
-    p.add_argument("--no-infer", dest="infer", action="store_false", help="Store raw transcript text verbatim")
-    p.add_argument("--keep-transcripts", action="store_true", help="Do not delete caption files after ingest")
+    p.add_argument("--no-infer", dest="infer", action="store_false", default=True, help="Store raw transcript text verbatim instead of LLM fact extraction")
     p.add_argument(
         "--whisper-model",
         default=None,
@@ -105,7 +103,6 @@ def main(argv=None) -> int:
     langs = [x.strip() for x in args.langs.split(",") if x.strip()]
 
     work = Path(args.work_dir)
-    transcripts_dir = work / "transcripts"
     state_path = str(work / f"state_{args.user_id}.json")
     state = yt_utils.load_state(state_path)
     processed = set(state.get("processed", []))
@@ -136,12 +133,12 @@ def main(argv=None) -> int:
 
         print(f"[{i}/{len(videos)}] {vid} :: {title}")
         try:
-            sub_path = yt_utils.download_transcript(video["url"], str(transcripts_dir), langs=langs)
+            sub_path = yt_utils.download_transcript(video["url"], str(work), langs=langs)
             if not sub_path:
                 if args.whisper_model:
                     print(f"    no captions, transcribing with whisper ({args.whisper_model})…")
                     sub_path = yt_utils.transcribe_with_whisper(
-                        video["url"], str(transcripts_dir), model_name=args.whisper_model
+                        video["url"], str(work), model_name=args.whisper_model
                     )
                 if not sub_path:
                     print("    no captions available, skipping")
@@ -149,11 +146,10 @@ def main(argv=None) -> int:
                     continue
 
             text = yt_utils.transcript_to_text(sub_path)
-            if not args.keep_transcripts:
-                try:
-                    os.remove(sub_path)
-                except OSError:
-                    pass
+            try:
+                os.remove(sub_path)
+            except OSError:
+                pass
 
             if not text:
                 print("    empty transcript, skipping")

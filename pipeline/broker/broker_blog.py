@@ -1,17 +1,14 @@
-"""Read the latest N records from history.db and produce an LLM-summarised report.
+"""Read podcast episodes from the FAISS docstore and produce an LLM-summarised report.
 
-Connects to the TeleMem history database, fetches recent memory-event records,
-groups them by time window, and calls an LLM to produce a human-readable
-Markdown summary.
+Reads the FAISS docstore, groups chunks by episode, and calls an LLM to
+produce a per-episode Markdown summary.
 
 Usage
 -----
-    python scripts/broker_blog.py
-
-    # override defaults
-    python scripts/broker_blog.py \
-        --db db/history.db \
-        --limit 20 \
+    python pipeline/broker/broker_blog.py \
+        --faiss-json db/faiss_db_podcast/xiaoyuzhou.json \
+        --user-id crossing \
+        --limit 3 \
         --output report.md
 """
 
@@ -20,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
@@ -30,80 +26,60 @@ _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent
 
 
-def fetch_history(
-    db_path: str | Path,
-    limit: int,
+def fetch_episodes_from_docstore(
+    faiss_json: Path,
     user_id: str | None = None,
-    faiss_json: str | Path | None = None,
+    limit: int | None = None,
 ) -> list[dict]:
-    """Return the latest *limit* rows from the history table as dicts.
+    """Read the FAISS docstore and return complete episodes grouped by episode_id.
 
-    If ``user_id`` is provided, results are restricted to memory_ids whose
-    docstore metadata in ``faiss_json`` has a matching ``user_id``.
+    Each episode dict has:
+        episode_id, title, url, created_at,
+        chunks: [{"chunk": int, "text": str}, ...]  sorted by chunk index.
+
+    Episodes are ordered newest-first (by the first chunk's created_at).
     """
-    db_path = Path(db_path)
-    if not db_path.exists():
-        print(f"ERROR: database not found: {db_path}", file=sys.stderr)
-        sys.exit(1)
-
-    allowed_ids: set[str] | None = None
-    if user_id:
-        if faiss_json is None:
-            faiss_json = _REPO_ROOT / "db" / "faiss_db" / "telemem.json"
-        allowed_ids = _memory_ids_for_user(Path(faiss_json), user_id)
-        if not allowed_ids:
-            print(
-                f"WARN: no memories found for user_id={user_id!r} in {faiss_json}",
-                file=sys.stderr,
-            )
-            return []
-
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    # Check if upload_date column exists (added by ingest_channel.py)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(history)")}
-    has_upload = "upload_date" in cols
-
-    select_cols = (
-        "SELECT id, memory_id, old_memory, new_memory, event, "
-        "       created_at, updated_at, is_deleted, actor_id, role"
-        + (", upload_date " if has_upload else " ")
-        + "FROM history "
-    )
-    if has_upload:
-        order_by = (
-            "ORDER BY COALESCE(NULLIF(upload_date, ''), substr(created_at, 1, 16)) DESC, "
-            "         created_at ASC, id ASC "
-        )
-    else:
-        order_by = "ORDER BY substr(created_at, 1, 16) DESC, created_at ASC, id ASC "
-
-    params: list = []
-    where = ""
-    if allowed_ids is not None:
-        # SQLite has a default limit of 999 host params; chunk if huge.
-        ids = list(allowed_ids)
-        placeholders = ",".join("?" for _ in ids)
-        where = f"WHERE memory_id IN ({placeholders}) "
-        params.extend(ids)
-
-    params.append(limit)
-    cur = conn.execute(select_cols + where + order_by + "LIMIT ?", params)
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
-
-
-def _memory_ids_for_user(faiss_json: Path, user_id: str) -> set[str]:
-    """Load telemem docstore JSON and return memory_ids where user_id matches."""
     if not faiss_json.exists():
-        print(f"ERROR: faiss docstore not found: {faiss_json}", file=sys.stderr)
+        print(f"ERROR: FAISS docstore not found: {faiss_json}", file=sys.stderr)
         sys.exit(1)
+
     with open(faiss_json, "r", encoding="utf-8") as fh:
         data = json.load(fh)
-    docstore = data.get("docstore", {}) if isinstance(data, dict) else {}
-    return {mid for mid, meta in docstore.items()
-            if isinstance(meta, dict) and meta.get("user_id") == user_id}
+
+    docstore: dict = data.get("docstore", {}) if isinstance(data, dict) else {}
+
+    episodes: dict[str, dict] = {}
+    for meta in docstore.values():
+        if not isinstance(meta, dict):
+            continue
+        ep_id = meta.get("episode_id")
+        if not ep_id:
+            continue
+        if user_id and meta.get("user_id") != user_id:
+            continue
+
+        if ep_id not in episodes:
+            episodes[ep_id] = {
+                "episode_id": ep_id,
+                "title": meta.get("title", ep_id),
+                "url": meta.get("url", ""),
+                "created_at": meta.get("created_at", ""),
+                "chunks": [],
+            }
+        episodes[ep_id]["chunks"].append({
+            "chunk": meta.get("chunk", 0),
+            "text": meta.get("data", ""),
+        })
+
+    for ep in episodes.values():
+        ep["chunks"].sort(key=lambda c: c["chunk"])
+
+    sorted_eps = sorted(
+        episodes.values(),
+        key=lambda e: e["created_at"],
+        reverse=True,
+    )
+    return sorted_eps[:limit] if limit else sorted_eps
 
 
 def build_openai_client():
@@ -140,69 +116,123 @@ def call_llm(client, model: str, system: str, user: str) -> str:
     return resp.choices[0].message.content.strip()
 
 
-SYSTEM_PROMPT = """\
-You are a financial research analyst.
-You receive a batch of memory records ingested from financial media channels.
-Each record contains a snippet of transcript text, an event type, and a timestamp.
+# --- Summarization prompts (map-reduce) ---
 
-Your task: produce a concise, well-structured Markdown report that summarises
-the key themes, market insights, and actionable takeaways from these records.
+_EXTRACT_PROMPT = """\
+You are reading a segment of a podcast transcript.
+Extract EVERY topic discussed in this segment and the key opinions or arguments made under each topic.
+Be exhaustive — do not skip any topic, even if it seems minor.
 
-Output format (strictly follow):
-## Key Themes
-- Bullet list of the 3-5 most important themes across all records
+Output format (repeat for each topic found):
+### <Topic Name>
+- <Opinion, argument, or key point>
+- <Another point>
 
-## Market Insights
-For each major topic, write a short paragraph (2-4 sentences) explaining the
-market situation, relevant data points, and implications.
+Write in the same language as the transcript.
+Output only the topic/opinion structure with no preamble or closing remarks.
+"""
 
-## Actionable Takeaways
-- Bullet list of concrete, actionable points for an investor
+_MERGE_PROMPT = """\
+You are given topic-and-opinion extractions from consecutive segments of the same podcast episode.
+Merge them into one coherent, complete summary:
+- Combine duplicate or closely related topics under a single heading
+- Preserve EVERY unique opinion, argument, and detail — nothing should be dropped
+- Use nested bullet points for sub-discussions within a topic
+- Keep headings concise but descriptive
 
-## Timeline
-Brief chronological summary of when the information was ingested.
+Output format (repeat for each topic):
+### <Topic Name>
+- <Key opinion or point>
+  - <Supporting detail if needed>
+- <Another point>
 
-Write in the same language as the source material.
-Keep the total report under 800 words.
+Write in the same language as the source.
+Output only the merged topic structure with no preamble or closing remarks.
 """
 
 
-def format_records_for_llm(rows: list[dict]) -> str:
-    """Build a text block summarising the raw DB rows for the LLM."""
+def summarize_episode(client, model: str, episode: dict) -> str:
+    """Produce a comprehensive topic-by-opinion summary via map-reduce.
+
+    Each chunk is processed independently (map) to extract topics and opinions,
+    then all extractions are merged into one coherent summary (reduce).
+    This prevents detail loss that can occur when passing very long transcripts
+    in a single LLM call.
+    """
+    chunks = [c["text"].strip() for c in episode["chunks"]]
+
+    # Map: extract topics + opinions from each chunk
+    print(f"  Extracting from {len(chunks)} chunk(s)...", file=sys.stderr)
+    extractions: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        print(f"    chunk {i}/{len(chunks)}", file=sys.stderr)
+        extraction = call_llm(client, model, _EXTRACT_PROMPT, chunk)
+        if extraction.strip():
+            extractions.append(extraction)
+
+    if not extractions:
+        return "_No content extracted._"
+
+    if len(extractions) == 1:
+        return extractions[0]
+
+    # Reduce: merge all extractions into one summary
+    print("  Merging extractions...", file=sys.stderr)
+    combined = "\n\n---\n\n".join(
+        f"[Segment {i}]\n{e}" for i, e in enumerate(extractions, 1)
+    )
+    return call_llm(client, model, _MERGE_PROMPT, combined)
+
+
+def _join_chunks(chunks: list[str], max_overlap: int = 300) -> str:
+    """Concatenate chunks, stripping the overlapping prefix from each successive one."""
+    if not chunks:
+        return ""
+    result = chunks[0]
+    for chunk in chunks[1:]:
+        check = min(max_overlap, len(result), len(chunk))
+        overlap = 0
+        for n in range(check, 0, -1):
+            if result.endswith(chunk[:n]):
+                overlap = n
+                break
+        result += chunk[overlap:]
+    return result
+
+
+def format_episodes_for_llm(episodes: list[dict]) -> str:
+    """Format complete episodes into a text block for the LLM."""
     lines = []
-    for i, r in enumerate(rows, 1):
-        text = r["new_memory"] or r["old_memory"] or "(empty)"
-        ts = r["created_at"] or "unknown"
-        upload = r.get("upload_date") or ""
-        header = f"[{i}] event={r['event']} | time={ts}"
-        if upload:
-            header += f" | upload_date={upload}"
-        lines.append(f"{header}\n{text}\n")
+    for ep in episodes:
+        lines.append(f"## {ep['title']}")
+        if ep["url"]:
+            lines.append(f"Source: {ep['url']}")
+        lines.append("")
+        text = _join_chunks([c["text"].strip() for c in ep["chunks"]])
+        lines.append(text)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
     return "\n".join(lines)
 
 
-def render_report_header(rows: list[dict], db_path: str) -> str:
-    """Return the Markdown header section (before the LLM summary)."""
-    if not rows:
-        return "# History Report\n\nNo records found.\n"
-
-    earliest = rows[-1]["created_at"] or "?"
-    latest = rows[0]["created_at"] or "?"
-    events = {}
-    for r in rows:
-        events[r["event"]] = events.get(r["event"], 0) + 1
-
+def render_report_header(episodes: list[dict], faiss_json: str) -> str:
+    """Return the Markdown header section."""
+    if not episodes:
+        return "# Podcast Episode Report\n\nNo episodes found.\n"
     lines = [
-        "# History Report\n",
+        "# Podcast Episode Report\n",
         "## Overview\n",
-        f"| Metric | Value |",
-        f"|--------|-------|",
-        f"| Database | `{db_path}` |",
-        f"| Records shown | {len(rows)} |",
-        f"| Time range | {earliest} — {latest} |",
-        f"| Events | {', '.join(f'{k}: {v}' for k, v in sorted(events.items()))} |",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Docstore | `{faiss_json}` |",
+        f"| Episodes | {len(episodes)} |",
+        f"| Total chunks | {sum(len(e['chunks']) for e in episodes)} |",
         "",
     ]
+    for ep in episodes:
+        lines.append(f"- **{ep['title']}** ({len(ep['chunks'])} chunks) — {ep['url']}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -212,15 +242,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--db",
-        default=str(_REPO_ROOT / "db" / "history.db"),
-        help="Path to history.db (default: db/history.db)",
+        "--faiss-json",
+        default=str(_REPO_ROOT / "db" / "faiss_db" / "telemem.json"),
+        help="Path to the podcast FAISS docstore JSON "
+             "(default: db/faiss_db/telemem.json)",
     )
     p.add_argument(
         "--limit", "-n",
         type=int,
         default=10,
-        help="Number of latest records to read (default: 10)",
+        help="Number of most recent episodes to read (default: 10)",
     )
     p.add_argument(
         "--output", "-o",
@@ -230,19 +261,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--raw",
         action="store_true",
-        help="Skip LLM summarisation; just dump records",
+        help="Skip LLM; dump full episode transcripts",
     )
     p.add_argument(
         "--user-id",
         default=None,
-        help="Only include records whose memories belong to this TeleMem user_id "
-             "(resolved via the FAISS docstore JSON).",
-    )
-    p.add_argument(
-        "--faiss-json",
-        default=str(_REPO_ROOT / "db" / "faiss_db" / "telemem.json"),
-        help="Path to the TeleMem FAISS docstore JSON (default: db/faiss_db/telemem.json). "
-             "Only used when --user-id is set.",
+        help="Only include episodes ingested under this TeleMem user_id",
     )
     return p.parse_args(argv)
 
@@ -250,39 +274,38 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    # --- fetch ---
+    faiss_json = Path(args.faiss_json)
     scope = f" (user_id={args.user_id})" if args.user_id else ""
-    print(f"Reading latest {args.limit} records from: {args.db}{scope}", file=sys.stderr)
-    rows = fetch_history(
-        args.db,
-        args.limit,
-        user_id=args.user_id,
-        faiss_json=args.faiss_json,
+    print(
+        f"Reading up to {args.limit} episode(s) from: {faiss_json}{scope}",
+        file=sys.stderr,
     )
-    print(f"  {len(rows)} records fetched.", file=sys.stderr)
+    episodes = fetch_episodes_from_docstore(
+        faiss_json,
+        user_id=args.user_id,
+        limit=args.limit,
+    )
+    print(f"  {len(episodes)} episode(s) found.", file=sys.stderr)
 
-    if not rows:
-        print("No records found.", file=sys.stderr)
+    if not episodes:
+        print("No episodes found.", file=sys.stderr)
         return 0
 
-    header = render_report_header(rows, args.db)
+    header = render_report_header(episodes, args.faiss_json)
 
     if args.raw:
-        # Dump without LLM
-        raw_section = "## Raw Records\n\n" + format_records_for_llm(rows)
-        report = header + "\n" + raw_section
+        report = header + "\n## Raw Episodes\n\n" + format_episodes_for_llm(episodes)
     else:
-        # --- LLM summary ---
         print("Building LLM client...", file=sys.stderr)
         client, model = build_openai_client()
         print(f"  LLM: {model}", file=sys.stderr)
+        sections: list[str] = []
+        for ep in episodes:
+            print(f"Summarising: {ep['title']}", file=sys.stderr)
+            ep_summary = summarize_episode(client, model, ep)
+            sections.append(f"## {ep['title']}\n\n{ep_summary}")
+        report = header + "\n" + "\n\n---\n\n".join(sections)
 
-        record_text = format_records_for_llm(rows)
-        print("Generating summary...", file=sys.stderr)
-        summary = call_llm(client, model, SYSTEM_PROMPT, record_text)
-        report = header + "\n" + summary
-
-    # --- output ---
     if args.output:
         Path(args.output).write_text(report, encoding="utf-8")
         print(f"Report saved to: {args.output}", file=sys.stderr)

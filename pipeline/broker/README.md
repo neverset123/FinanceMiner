@@ -16,8 +16,8 @@ python pipeline/broker/broker_blog.py --user-id standfordRSI -n 200 -o report_rs
 ´´´
 export WHISPER_MODEL_PATH=~/Workspace/whisper-medium/
 export EMBEDDING_MODEL=qgenie_embedd
-HF_HUB_OFFLINE=1 python pipeline/broker/ingest_podcast.py --whisper-model medium --user-id crossing --no-infer
-python pipeline/broker/broker_blog.py --db db/history_podcast.db -n 20 -o report_cross.md  --raw
+HF_HUB_OFFLINE=1 python pipeline/broker/ingest_podcast.py --whisper-model medium --user-id crossing --num-speakers 2 --no-infer --diarize 
+python pipeline/broker/broker_blog.py --faiss-json db/faiss_db_podcast/xiaoyuzhou.json -n 1 -o report_cross.md
 ´´´
 
 ### sc
