@@ -84,181 +84,63 @@ def download_file(session: requests.Session, url: str, dest: Path) -> None:
         tmp.replace(dest)
 
 
-def transcribe_audio(model, audio_path: str, language: str | None = None) -> str:
-    """Transcribe a local audio file with a preloaded faster-whisper model."""
-    from yt_utils import _to_simplified  # traditional -> simplified Chinese
+def transcribe_audio_diarized(audio_path: str, language: str | None = None) -> str:
+    """Transcribe with speaker diarization using FunASR (ASR + CAM++ in one pass).
 
-    transcribe_lang = language
-    if language is None:
-        _, detect = model.transcribe(audio_path, language=None, beam_size=1)
-        if detect.language == "zh":
-            transcribe_lang = "zh"
-    segments, _ = model.transcribe(audio_path, language=transcribe_lang, beam_size=5)
-    return _to_simplified(" ".join(s.text.strip() for s in segments if s.text.strip()))
+    FunASR's SenseVoiceSmall handles ASR and its CAM++ model (trained on 200k
+    Mandarin speakers) handles diarization — no HuggingFace token required.
+    Models are downloaded from ModelScope on first use.
 
-
-def _get_whisper_segments(model, audio_path: str, language: str | None = None):
-    """Run faster-whisper and return (segments_list, detected_language)."""
-    transcribe_lang = language
-    if language is None:
-        _, detect = model.transcribe(audio_path, language=None, beam_size=1)
-        if detect.language == "zh":
-            transcribe_lang = "zh"
-    segments, info = model.transcribe(audio_path, language=transcribe_lang, beam_size=5)
-    return list(segments), info.language
-
-
-def diarize_audio(
-    audio_path: str,
-    num_speakers: int | None = None,
-    min_speakers: int = 1,
-    max_speakers: int = 8,
-) -> list[dict]:
-    """Speaker diarization using resemblyzer embeddings + agglomerative clustering.
-
-    Fully offline — a ~17 MB speaker-encoder is downloaded automatically by
-    resemblyzer on first use (no HuggingFace token required).
-
-    Requirements: ``pip install resemblyzer scikit-learn``
+    Requirements: ``pip install funasr modelscope``
     """
     try:
-        from resemblyzer import VoiceEncoder, preprocess_wav
+        from funasr import AutoModel as FunASRAutoModel
+        from funasr.utils.postprocess_utils import rich_transcription_postprocess
     except ImportError as exc:
         raise ImportError(
-            "resemblyzer is required for offline diarization. "
-            "Install with: pip install resemblyzer"
-        ) from exc
-    try:
-        import numpy as np
-        from sklearn.cluster import AgglomerativeClustering
-        from sklearn.preprocessing import normalize
-    except ImportError as exc:
-        raise ImportError(
-            "scikit-learn is required for offline diarization. "
-            "Install with: pip install scikit-learn"
+            "funasr is required for transcription. "
+            "Install with: pip install funasr modelscope"
         ) from exc
 
-    SAMPLE_RATE = 16_000
-    WINDOW_SEC = 1.5
-    STEP_SEC = 0.75
-
-    print("  [offline-diarize] preprocessing audio ...")
-    wav = preprocess_wav(audio_path)  # resamples to 16 kHz mono float32
-
-    window_len = int(WINDOW_SEC * SAMPLE_RATE)
-    step_len = int(STEP_SEC * SAMPLE_RATE)
-
-    slices, centers = [], []
-    pos = 0
-    while pos + window_len <= len(wav):
-        slices.append(wav[pos : pos + window_len])
-        centers.append((pos + pos + window_len) / 2 / SAMPLE_RATE)
-        pos += step_len
-
-    if not slices:
-        return []
-
-    print(f"  [offline-diarize] computing embeddings for {len(slices)} windows ...")
-    encoder = VoiceEncoder(device="cpu", verbose=False)
-    embeds = np.array([encoder.embed_utterance(s) for s in slices])  # (N, 256)
-    embeds = normalize(embeds)
-
-    if num_speakers is not None:
-        n_clusters = num_speakers
-    else:
-        n_clusters = _estimate_speaker_count(embeds, min_speakers, max_speakers)
-
-    print(f"  [offline-diarize] clustering into {n_clusters} speaker(s) ...")
-    labels = AgglomerativeClustering(
-        n_clusters=n_clusters, metric="cosine", linkage="average"
-    ).fit_predict(embeds).tolist()
-
-    print(f"  Diarization (offline): {len(set(labels))} unique speaker(s).")
-    return _windows_to_segments(centers, labels, WINDOW_SEC / 2)
-
-
-def _estimate_speaker_count(embeds, min_k: int, max_k: int) -> int:
-    """Pick the cluster count that maximises the silhouette score."""
-    from sklearn.cluster import AgglomerativeClustering
-    from sklearn.metrics import silhouette_score
-
-    max_k = min(max_k, len(embeds) - 1)
-    if min_k >= max_k:
-        return max(min_k, 1)
-
-    best_k, best_score = min_k, -1.0
-    for k in range(min_k, max_k + 1):
-        labels = AgglomerativeClustering(
-            n_clusters=k, metric="cosine", linkage="average"
-        ).fit_predict(embeds)
-        try:
-            score = silhouette_score(embeds, labels, metric="cosine")
-        except Exception:
-            score = -1.0
-        if score > best_score:
-            best_score, best_k = score, k
-    return best_k
-
-
-def _windows_to_segments(
-    centers: list[float], labels: list[int], half_win: float
-) -> list[dict]:
-    """Convert per-window speaker labels into contiguous time segments."""
-    if not centers:
-        return []
-    segments: list[dict] = []
-    cur_start = centers[0] - half_win
-    cur_label = labels[0]
-    for t, lab in zip(centers[1:], labels[1:]):
-        if lab != cur_label:
-            segments.append({
-                "start": max(0.0, cur_start),
-                "end": t - half_win,
-                "speaker": f"SPEAKER_{cur_label:02d}",
-            })
-            cur_start = t - half_win
-            cur_label = lab
-    segments.append({
-        "start": max(0.0, cur_start),
-        "end": centers[-1] + half_win,
-        "speaker": f"SPEAKER_{cur_label:02d}",
-    })
-    return segments
-
-
-def _assign_speakers(whisper_segments, diar_segments: list[dict]) -> list[dict]:
-    """Map each whisper segment to the diarization speaker with most overlap."""
-    result = []
-    for seg in whisper_segments:
-        best_speaker = "Unknown"
-        best_overlap = 0.0
-        for d in diar_segments:
-            overlap = max(0.0, min(seg.end, d["end"]) - max(seg.start, d["start"]))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = d["speaker"]
-        result.append({
-            "start": seg.start,
-            "end": seg.end,
-            "text": seg.text.strip(),
-            "speaker": best_speaker,
-        })
-    return result
-
-
-def _format_diarized_transcript(labeled_segments: list[dict]) -> str:
-    """Merge consecutive same-speaker turns and format as '[SPEAKER_X]: text'."""
     from yt_utils import _to_simplified
+
+    device = "cuda" if os.getenv("WHISPER_DEVICE", "auto") == "cuda" else "cpu"
+    print(f"  Loading FunASR (SenseVoiceSmall + CAM++, device={device}) ...")
+    funasr_model = FunASRAutoModel(
+        model="iic/SenseVoiceSmall",
+        vad_model="fsmn-vad",
+        vad_kwargs={"max_single_segment_time": 30000},
+        spk_model="cam++",
+        device=device,
+        disable_update=True,
+    )
+
+    print("  Transcribing with speaker diarization ...")
+    result = funasr_model.generate(
+        input=audio_path,
+        cache={},
+        language=language or "auto",
+        use_itn=True,
+        batch_size_s=60,
+        merge_vad=True,
+        merge_length_s=15,
+        spk_num=2,          # 2-speaker interview: forces correct clustering
+    )
+
+    sentences = result[0].get("sentence_info") if result else None
+    if not sentences:
+        raw = result[0].get("text", "") if result else ""
+        return _to_simplified(rich_transcription_postprocess(raw))
 
     lines: list[str] = []
     current_speaker: str | None = None
     current_texts: list[str] = []
 
-    for seg in labeled_segments:
-        text = seg["text"].strip()
+    for s in sentences:
+        speaker = f"SPEAKER_{s['spk']}"
+        text = rich_transcription_postprocess(s.get("text", "")).strip()
         if not text:
             continue
-        speaker = seg["speaker"]
         if speaker != current_speaker:
             if current_texts and current_speaker is not None:
                 lines.append(f"[{current_speaker}]: {' '.join(current_texts)}")
@@ -271,39 +153,6 @@ def _format_diarized_transcript(labeled_segments: list[dict]) -> str:
         lines.append(f"[{current_speaker}]: {' '.join(current_texts)}")
 
     return _to_simplified("\n".join(lines))
-
-
-def transcribe_audio_diarized(
-    model,
-    audio_path: str,
-    language: str | None = None,
-    num_speakers: int | None = None,
-    max_speakers: int = 8,
-) -> str:
-    """Transcribe with per-speaker labels using resemblyzer + faster-whisper.
-
-    Returns a transcript where each speaker's turns are prefixed with
-    ``[SPEAKER_00]: ``, ``[SPEAKER_01]: ``, etc.
-    """
-    print("  Transcribing (with timestamps) ...")
-    whisper_segs, detected_lang = _get_whisper_segments(model, audio_path, language)
-    print(f"  Whisper: {len(whisper_segs)} segment(s), lang={detected_lang!r}")
-
-    diar_segs = diarize_audio(audio_path, num_speakers=num_speakers, max_speakers=max_speakers)
-    labeled = _assign_speakers(whisper_segs, diar_segs)
-    return _format_diarized_transcript(labeled)
-
-
-def load_whisper_model(model_name: str):
-    import os
-
-    from faster_whisper import WhisperModel
-
-    device = os.getenv("WHISPER_DEVICE", "auto")
-    compute = "float16" if device == "cuda" else "int8"
-    model_path = os.getenv("WHISPER_MODEL_PATH") or model_name
-    print(f"Loading whisper model {model_path!r} (device={device}) ...")
-    return WhisperModel(model_path, device=device, compute_type=compute)
 
 
 def build_isolated_memory(collection: str, vector_path: str, history_db: str):
@@ -334,7 +183,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--delay", type=float, default=1.0, help="Seconds between requests")
 
-    p.add_argument("--whisper-model", default="medium", help="faster-whisper model size or name")
     p.add_argument("--language", default=None, help="Force transcription language (e.g. zh); auto-detect if unset")
     p.add_argument("--chunk-chars", type=int, default=4000, help="Max characters per memory chunk (0 = no split)")
     p.add_argument("--no-infer", dest="infer", action="store_false", default=True, help="Store raw transcript text verbatim instead of LLM fact extraction")
@@ -347,13 +195,6 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     p.add_argument("--work-dir", default="./data/podcast_audio", help="Where the processed-state file is kept")
 
-    # --- Speaker diarization ---
-    p.add_argument("--diarize", action="store_true", default=False,
-                   help="Identify individual speakers (offline; requires resemblyzer + scikit-learn)")
-    p.add_argument("--num-speakers", type=int, default=None,
-                   help="Known number of speakers; improves accuracy when set (auto-detected otherwise)")
-    p.add_argument("--max-speakers", type=int, default=8,
-                   help="Upper bound for auto speaker count detection (default: 8)")
 
     return p.parse_args(argv)
 
@@ -371,7 +212,6 @@ def main(argv=None) -> int:
     state = yt_utils.load_state(state_path)
     processed = set(state.get("processed", []))
 
-    whisper = load_whisper_model(args.whisper_model)
     memory = build_isolated_memory(args.collection, args.vector_path, args.history_db)
     print(
         f"Ingesting into collection={args.collection!r} vector_path={args.vector_path!r} "
@@ -413,15 +253,7 @@ def main(argv=None) -> int:
                 print(f"  Done ({size_mb:.1f} MB)")
 
                 print("  Transcribing ...")
-                if args.diarize:
-                    text = transcribe_audio_diarized(
-                        whisper, str(dest),
-                        language=args.language,
-                        num_speakers=args.num_speakers,
-                        max_speakers=args.max_speakers,
-                    )
-                else:
-                    text = transcribe_audio(whisper, str(dest), language=args.language)
+                text = transcribe_audio_diarized(str(dest), language=args.language)
                 if not text:
                     print("  Empty transcript; skipping ingest.")
                     continue
@@ -435,7 +267,6 @@ def main(argv=None) -> int:
                         "url": ep_url,
                         "chunk": j,
                         "chunks_total": len(chunks),
-                        "diarized": args.diarize,
                     }
                     memory.add(chunk, user_id=args.user_id, metadata=metadata, infer=args.infer)
 
